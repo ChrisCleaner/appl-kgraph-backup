@@ -19,23 +19,28 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Get the current files of the source repo's main branch
-          git clone --depth 1 --branch main https://github.com/pbl-nl/appl-kgraph.git source
-          SRC_SHA=$(git -C source rev-parse HEAD)
-
-          # Get this backup repo; create main if it doesn't exist yet
-          git clone "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" backup
+          git clone --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" backup
           cd backup
-          git checkout main 2>/dev/null || git checkout --orphan main
 
-          # Replace all tracked content with the source files
-          find . -mindepth 1 -maxdepth 1 -name .git -prune -o -exec rm -rf {} +
-          rsync -a --exclude='.git' ../source/ ./
+          # Current tip of the backup's main branch, if it exists yet
+          PARENT=""
+          PARENT_TREE=""
+          if git fetch --depth 1 origin main; then
+            PARENT=$(git rev-parse FETCH_HEAD)
+            PARENT_TREE=$(git rev-parse "FETCH_HEAD^{tree}")
+          fi
 
-          git add -A
-          if git diff --cached --quiet; then
+          # Latest state of the source repo's main branch
+          git fetch --depth 1 https://github.com/pbl-nl/appl-kgraph.git main
+          SRC_SHA=$(git rev-parse FETCH_HEAD)
+          SRC_TREE=$(git rev-parse "FETCH_HEAD^{tree}")
+
+          if [ "$SRC_TREE" = "$PARENT_TREE" ]; then
             echo "Source unchanged since last backup - nothing to commit."
           else
-            git commit -m "Backup snapshot of pbl-nl/appl-kgraph@${SRC_SHA}"
-            git push origin main
+            # Record the source's file tree as a new snapshot commit on main.
+            # No files are deleted or copied on disk; git derives the changes.
+            NEW=$(git commit-tree "$SRC_TREE" ${PARENT:+-p "$PARENT"} \
+              -m "Backup snapshot of pbl-nl/appl-kgraph@${SRC_SHA}")
+            git push origin "$NEW:refs/heads/main"
           fi
