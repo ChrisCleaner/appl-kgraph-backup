@@ -1,0 +1,982 @@
+from __future__ import annotations
+from datetime import datetime, timezone
+import json
+import mimetypes
+import uuid
+from pathlib import Path
+from typing import Callable, Dict, Any, List, Sequence, Tuple, Optional, Union
+from collections import Counter, defaultdict
+import os
+# local imports
+from db_storage import Storage, _normalize_pair
+from fileparser import FileParser
+from chunker import chunk_parsed_pages
+from extractor import extract_from_chunks
+from graph_pickle import save_graph_to_pickle, build_graph_from_storage
+from llm import llm_summarize_text
+from settings import VALID_EXTENSIONS, settings
+from logging_utils import configure_file_logger
+from project_paths import (
+    ProjectPaths,
+    ensure_project_dirs,
+    list_document_paths,
+    resolve_project_paths,
+)
+import hashlib
+
+
+LOGGER = configure_file_logger(
+    "appl_kgraph.ingestion",
+    log_file=Path("ingestion.log"),
+    level=settings.logging.internal_log_level,
+    enabled=settings.logging.internal_logging_enabled,
+)
+
+#--------------------------------------------------
+# Helpers 
+#--------------------------------------------------
+
+def normalize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes metadata dictionary by lowercasing keys and standardizing the language field.
+
+    Args:
+        meta (Dict[str, Any]): The metadata dictionary to normalize.
+
+    Returns:
+        Dict[str, Any]: Normalized metadata with lowercase keys.
+    """
+    # Lower-case keys, unify language key
+    meta = {str(k).lower(): v for k, v in (meta or {}).items()}
+    # normalize to 'language'
+    if "Language" in meta and "language" not in meta:
+        meta["language"] = meta.pop("Language")
+    return meta
+
+def file_sha256(p: Path, chunk_size=1024*1024) -> str:
+    """
+    Computes the SHA-256 hash of a file.
+
+    Args:
+        p (Path): Path to the file.
+        chunk_size (int, optional): Size of chunks to read at a time. Defaults to 1MB.
+
+    Returns:
+        str: The hexadecimal SHA-256 hash of the file.
+    """
+    h = hashlib.sha256()
+    with p.open('rb') as f:
+        for chunk in iter(lambda: f.read(chunk_size), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def should_skip_ingestion(storage: Storage, p: Path, content_hash: Optional[str] = None) -> bool:
+    """
+    Determines whether a file should be skipped during ingestion based on content hash.
+
+    Args:
+        storage (Storage): The storage instance to query.
+        p (Path): Path to the file to check.
+        content_hash (Optional[str], optional): Pre-computed content hash. If None, will be computed.
+
+    Returns:
+        bool: True if file has already been ingested with the same content, False otherwise.
+    """
+    doc = storage.get_document_by_filename(p.name)
+    if not doc:
+        return False
+    ch = content_hash or file_sha256(p)
+    return doc.get("content_hash") == ch
+
+# Core functions ------------------------------------
+
+def parse_to_pages(filepath: Path):
+    """
+    Parses a file into pages and extracts metadata.
+
+    Args:
+        filepath (Path): Path to the file to parse.
+
+    Returns:
+        Tuple[Optional[List[Tuple[int, str]]], Dict[str, Any]]: A tuple containing:
+            - pages: List of (page_number, text) tuples, or None if parsing fails
+            - meta: Dictionary of extracted metadata
+    """
+    pages = None
+    meta = {}
+    try:
+        fp = FileParser()
+        res = fp.parse_file(str(filepath))
+        if isinstance(res, tuple):
+            pages = res[0]
+            if len(res) > 1 and isinstance(res[1], dict):
+                meta = res[1]
+        else:
+            pages = res
+    except Exception:
+        pages = None
+
+    return pages, meta
+
+def build_chunks(
+    pages: Sequence[Tuple[int, str]],
+    doc_id: str,
+    filename: str,
+    *,
+    filepath: Optional[str] = None,
+    document_language: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Normalize chunks for storage:
+      - Ensures chunk_uuid, chunk_id, char_count, start_page, end_page
+      - Attaches doc_id and filename to each chunk
+      - Returns [] on chunking error (non-fatal)
+    """
+    try:
+        raw = chunk_parsed_pages(pages)
+    except Exception:
+        return []
+
+    norm: List[Dict[str, Any]] = []
+    for i, c in enumerate(raw or []):
+        text = (c.get("text") or "")
+        start = int(c.get("start_page", 0))
+        end = int(c.get("end_page", start))
+        norm.append({
+            "chunk_uuid": c.get("chunk_uuid") or str(uuid.uuid4()),
+            "doc_id": doc_id,
+            "chunk_id": int(c.get("chunk_id", i)),
+            "filename": filename,
+            "filepath": filepath,
+            "document_language": document_language,
+            "text": text,
+            "char_count": int(c.get("char_count", len(text))),
+            "start_page": start,
+            "end_page": end,
+        })
+    return norm
+
+
+def _resolve_runtime_project_paths(
+    *,
+    paths: Sequence[Path],
+    documents_root: Optional[Union[Path, str]] = None,
+    project_paths: Optional[ProjectPaths] = None,
+) -> Optional[ProjectPaths]:
+    if project_paths is not None:
+        return project_paths
+    if documents_root is not None:
+        return resolve_project_paths(documents_root)
+    return None
+
+
+def _configure_ingestion_logger(project_paths: Optional[ProjectPaths]) -> None:
+    log_file = (
+        project_paths.ingestion_log_file
+        if project_paths is not None
+        else Path("ingestion.log")
+    )
+    configure_file_logger(
+        "appl_kgraph.ingestion",
+        log_file=log_file,
+        level=settings.logging.internal_log_level,
+        enabled=settings.logging.internal_logging_enabled,
+    )
+
+
+def _write_extraction_diagnostics(
+    project_paths: Optional[ProjectPaths],
+    filename: str,
+    validation_results: List[Dict[str, Any]],
+) -> None:
+    if (
+        project_paths is None
+        or not validation_results
+        or not settings.logging.internal_logging_enabled
+    ):
+        return
+    ensure_project_dirs(project_paths)
+    target = project_paths.extraction_diagnostics_dir / f"{Path(filename).stem}.validation.json"
+    target.write_text(
+        json.dumps(validation_results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_raw_document_snapshot(
+    project_paths: Optional[ProjectPaths],
+    *,
+    filename: str,
+    doc_meta: Dict[str, Any],
+    raw_text: str,
+) -> None:
+    if project_paths is None:
+        return
+    ensure_project_dirs(project_paths)
+    payload = {
+        "filename": filename,
+        "filepath": doc_meta.get("filepath"),
+        "doc_id": doc_meta.get("doc_id"),
+        "content_hash": doc_meta.get("content_hash"),
+        "language": doc_meta.get("language", "unknown"),
+        "char_count": len(raw_text),
+        "extracted_at": datetime.now(timezone.utc).isoformat(),
+        "raw_text": raw_text,
+    }
+    target = project_paths.raw_documents_dir / f"{Path(filename).name}.raw.json"
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_retrieval_graph_snapshot(
+    storage: Storage,
+    project_paths: Optional[ProjectPaths],
+) -> Optional[Path]:
+    if project_paths is None:
+        return None
+    ensure_project_dirs(project_paths)
+    graph = build_graph_from_storage(storage, logger=LOGGER)
+    return save_graph_to_pickle(graph, project_paths.retrieval_graph_pickle_file)
+
+def _resolve_type(votes: Counter, existing_type: str = "") -> str:
+    existing = (existing_type or "").strip()
+    if not votes:
+        return existing or "unknown"
+
+    normalized: Dict[str, int] = {}
+    canonical: Dict[str, str] = {}
+    for raw_type, count in votes.items():
+        candidate = (raw_type or "").strip()
+        if not candidate or candidate.lower() == "unknown":
+            continue
+        key = candidate.lower()
+        normalized[key] = normalized.get(key, 0) + count
+        canonical.setdefault(key, candidate)
+
+    if normalized:
+        max_count = max(normalized.values())
+        contenders = sorted([k for k, c in normalized.items() if c == max_count])
+        existing_key = existing.lower()
+        for key in contenders:
+            if existing and existing_key == key:
+                return canonical[key]
+        return canonical[contenders[0]]
+
+    if existing and existing.lower() != "unknown":
+        return existing
+
+    # All votes were unknown or empty; default to unknown to avoid oscillation.
+    return "unknown"
+
+
+def dedupe_entities_for_vectors(entities: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicates entities by name, preferring typed entries over "unknown" types.
+
+    Args:
+        entities (Sequence[Dict[str, Any]]): A sequence of entity dictionaries with 'name' and 'type' fields.
+
+    Returns:
+        List[Dict[str, Any]]: Deduplicated list of entities maintaining insertion order.
+    """
+
+    dedup: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for ent in entities or []:
+        name = str(ent.get("name", "") or "").strip()
+        if not name:
+            continue
+
+        current = dedup.get(name)
+        if current is None:
+            dedup[name] = ent
+            order.append(name)
+            continue
+
+        current_type = str(current.get("type", "") or "").strip().lower()
+        new_type = str(ent.get("type", "") or "").strip().lower()
+
+        if current_type == "unknown" and new_type and new_type != "unknown":
+            dedup[name] = ent
+        elif new_type == "unknown" and current_type and current_type != "unknown":
+            continue
+        else:
+            dedup[name] = ent
+
+    return [dedup[name] for name in order]
+
+
+def group_nodes(storage: Storage, nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Consolidate entity nodes by name (unique key) and determine the final node type by
+    majority vote among all available hints (incoming + existing rows).
+    """
+
+    delim = settings.ingestion.delimiter
+    grouped: Dict[str, Dict[str, Any]] = {}
+
+    for n in nodes:
+        name = str(n.get("name", "")).strip()
+        if not name:
+            continue
+        etype = str(n.get("type", "")).strip()
+        bucket = grouped.setdefault(name, {
+            "attrs": [],
+            "votes": Counter(),
+            "existing": None,
+        })
+        bucket["attrs"].append({
+            "description": n.get("description", "") or "",
+            "source_id": n.get("source_id", "") or "",
+            "filepath": n.get("filepath", "") or "",
+        })
+        vote_key = etype or "unknown"
+        bucket["votes"][vote_key] += 1
+
+    names = sorted(grouped.keys())
+    if names:
+        existing_rows = storage.get_nodes(names) or []
+        for row in existing_rows:
+            name = str(row.get("name", "") or "").strip()
+            if not name:
+                continue
+            bucket = grouped.setdefault(name, {
+                "attrs": [],
+                "votes": Counter(),
+                "existing": None,
+            })
+            bucket["attrs"].append({
+                "description": row.get("description", "") or "",
+                "source_id": row.get("source_id", "") or "",
+                "filepath": row.get("filepath", "") or "",
+            })
+            existing_type = str(row.get("type", "") or "").strip()
+            bucket["votes"][existing_type or "unknown"] += 1
+            bucket["existing"] = row
+
+    merged: List[Dict[str, Any]] = []
+    for name, data in grouped.items():
+        existing_type = ""
+        if data.get("existing"):
+            existing_type = str(data["existing"].get("type", "") or "").strip()
+
+        def join(field: str) -> str:
+            parts = []
+            for a in data["attrs"]:
+                v = (a.get(field, "") or "")
+                if v:
+                    parts.extend(p.strip() for p in v.split(delim) if p.strip())
+            uniq: List[str] = []
+            seen = set()
+            for p in parts:
+                if p not in seen:
+                    seen.add(p)
+                    uniq.append(p)
+            return delim.join(uniq)
+
+        final_type = _resolve_type(data["votes"], existing_type)
+        merged.append({
+            "name": name,
+            "type": final_type,
+            "description": join("description"),
+            "source_id": join("source_id"),
+            "filepath": join("filepath"),
+        })
+    return merged
+
+
+def group_edges(storage: Storage, edges: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Consolidate relation edges by normalized undirected (source_name, target_name),
+    merge duplicates across chunks/files, and blend in any already-stored rows via
+    a single bulk fetch.
+
+    Input edge schema (expected keys on each dict):
+      - source_name (str), target_name (str), weight (number|None, optional),
+        description (str, optional), keywords (str, optional), source_id (str, optional),
+        filepath (str, optional)
+
+    Steps:
+      1) Normalize each (source, target) to a canonical undirected pair and accumulate attributes.
+      2) Bulk-fetch any existing edges for ALL pairs (storage.get_edges) and inject their attrs
+         into the same groups to preserve/merge prior state.
+      3) For each pair, merge text fields using the configured delimiter, sum weights (ignoring None),
+         and return a flat list of normalized edge dicts.
+
+    Notes:
+      - Keywords provided as comma-separated strings are normalized once into delimiter-joined sets.
+      - Uses _normalize_pair() to ensure undirected uniqueness is consistent with the DB/vector IDs.
+    """
+    delim = settings.ingestion.delimiter
+
+    # 1) group incoming by normalized undirected pair
+    grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for e in edges:
+        src, tgt = _normalize_pair(e["source_name"], e["target_name"])
+        grouped[(src, tgt)].append({
+            "description": e.get("description", "") or "",
+            # normalize comma-separated input, keep unique tokens only
+            "keywords": delim.join({k.strip() for k in (e.get("keywords", "") or "").split(",") if k.strip()}),
+            "weight": float(e["weight"]) if e.get("weight") is not None else None,
+            "source_id": e.get("source_id", "") or "",
+            "filepath": e.get("filepath", "") or "",
+        })
+
+    # 2) bulk fetch ALL existing edges once
+    pairs = list(grouped.keys())
+    if pairs:
+        existing_edges = storage.get_edges(pairs) or []
+        for ex in existing_edges:
+            u_src, u_tgt = _normalize_pair(ex["source_name"], ex["target_name"])
+            grouped[(u_src, u_tgt)].append({
+                "description": ex.get("description", "") or "",
+                "keywords": ex.get("keywords", "") or "",
+                "weight": ex.get("weight", 0),
+                "source_id": ex.get("source_id", "") or "",
+                "filepath": ex.get("filepath", "") or "",
+            })
+
+    # 3) collapse each pair's attrs into one merged record
+    merged: List[Dict[str, Any]] = []
+    for (src, tgt), attrs in grouped.items():
+        desc = delim.join({
+            s.strip()
+            for a in attrs
+            for s in (a.get("description", "") or "").split(delim)
+            if s.strip()
+        })
+        kws = delim.join({
+            k.strip()
+            for a in attrs
+            for k in (a.get("keywords", "") or "").split(delim)
+            if k.strip()
+        })
+        w_sum = sum(a["weight"] for a in attrs if a.get("weight") is not None)
+        srcs = delim.join({
+            s.strip()
+            for a in attrs
+            for s in (a.get("source_id", "") or "").split(delim)
+            if s.strip()
+        })
+        fps = delim.join({
+            s.strip()
+            for a in attrs
+            for s in (a.get("filepath", "") or "").split(delim)
+            if s.strip()
+        })
+
+        merged.append({
+            "source_name": src,
+            "target_name": tgt,
+            "description": desc,
+            "keywords": kws,
+            "weight": w_sum,
+            "source_id": srcs,
+            "filepath": fps,
+        })
+
+    return merged
+
+def merge_graph_data(storage: Storage, entities: List[Dict[str, Any]], relations: List[Dict[str, Any]]):
+    """Merges new entities and relations with existing ones in the storage."""
+    merged_entities = []
+    entities = group_nodes(storage, entities)
+    for ent in entities:
+        if len(ent["description"].split("||")) > settings.ingestion.description_segment_limit:
+            ent["description"] = llm_summarize_text(ent["description"])
+        merged_entities.append(ent)
+
+    
+    merged_relations = []
+    relations = group_edges(storage, relations)
+    for rel in relations:
+        if len(rel["description"].split("||")) > settings.ingestion.description_segment_limit:
+            rel["description"] = llm_summarize_text(rel["description"])
+        merged_relations.append(rel)
+
+    return merged_entities, merged_relations
+
+
+def ensure_edge_endpoints(storage: Storage, edges: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Ensure that nodes exist for every endpoint referenced in the provided edges.
+
+    - Node identity is based on the node name only (string equality).
+    - Note to self: Does not update node types anymore because we don't extract src/tgt types.
+    - Newly created nodes are given type "unknown" and empty metadata fields.
+    - Existing nodes are left unchanged.
+
+    Returns
+    -------
+    affected : List[Dict[str, Any]]
+        A list of nodes that were newly created (so that vector embeddings can be
+        generated later). If no new nodes were needed, the list is empty.
+    """
+    # Collect all unique node names from edges (source + target)
+    names = {
+        (e.get("source_name") or "").strip()
+        for e in edges
+    } | {
+        (e.get("target_name") or "").strip()
+        for e in edges
+    }
+    names.discard("")  # drop empty names
+
+    if not names:
+        return []
+
+    # Fetch any existing nodes in bulk
+    existing_rows = storage.get_nodes(list(names)) or []
+    existing_by_name = {row["name"]: row for row in existing_rows if row.get("name")}
+
+    pending: List[Dict[str, Any]] = []   # nodes to insert into storage
+    affected: List[Dict[str, Any]] = []  # nodes we created (return to caller)
+
+    for nm in names:
+        if nm not in existing_by_name:
+            # Create a new placeholder node
+            node = {
+                "name": nm,
+                "type": "unknown",
+                "description": "",
+                "source_id": "",
+                "filepath": "",
+            }
+            pending.append(node)
+            affected.append(node)
+
+    # Bulk insert missing nodes
+    if pending:
+        storage.upsert_nodes(pending)
+
+    return affected
+
+def remove_document_from_storage(storage: Storage, filename: str) -> None:
+    """
+    Removes a document and all its associated data from storage.
+
+    This function performs a comprehensive cleanup across all storage layers:
+    1. DocumentsDB: Removes the document record
+    2. ChunksDB: Removes all chunks associated with the document
+    3. GraphDB: Updates nodes and edges by removing chunk UUIDs from source_id fields,
+       and deletes nodes/edges that have no remaining source_ids
+    4. ChunkVectors: Removes chunk embeddings from the vector database
+    5. EntityVectors: Updates entity source_ids and removes entities with no remaining sources
+    6. RelationVectors: Updates relation source_ids and removes relations with no remaining sources
+
+    Args:
+        storage (Storage): The storage instance.
+        filename (str): The filename of the document to remove.
+    """
+    # Get the document to retrieve its doc_id
+    doc = storage.get_document_by_filename(filename)
+    if not doc or not doc.get("doc_id"):
+        LOGGER.warning("Document %s not found in storage", filename)
+        return
+
+    doc_id = doc["doc_id"]
+    LOGGER.info("Removing document %s (doc_id=%s)", filename, doc_id)
+
+    # Step 1: Get all chunks associated with this document
+    chunks = storage.get_chunks_by_doc_id(doc_id)
+    if not chunks:
+        LOGGER.info("No chunks found for document %s", filename)
+        # Still proceed to delete the document itself
+        storage.delete_document(doc_id)
+        return
+
+    chunk_uuids = [c["chunk_uuid"] for c in chunks]
+    LOGGER.info("Found %d chunks to process for %s", len(chunk_uuids), filename)
+
+    # Step 2: Process GraphDB - update nodes and edges
+    delim = settings.ingestion.delimiter
+    nodes_to_update: List[Dict[str, Any]] = []
+    nodes_to_delete: List[str] = []
+    edges_to_update: List[Dict[str, Any]] = []
+    edges_to_delete: List[Tuple[str, str]] = []
+
+    nodes = storage.get_nodes_by_chunk_uuids(chunk_uuids)
+    edges = storage.get_edges_by_chunk_uuids(chunk_uuids)
+
+    # Remove duplicates if any due to multiple chunks referencing same nodes/edges
+    nodes = [v for _,v in {n["name"]: n for n in nodes}.items()]
+    edges = [v for _,v in {(e["source_name"], e["target_name"]): e for e in edges}.items()]
+    
+    # make source_id a list for easier processing
+    nodes = [ {k: v if k != "source_id" else (v or "").split(delim) for k,v in n.items()} 
+            for n in nodes]
+    edges = [ {k: v if k != "source_id" else (v or "").split(delim) for k,v in e.items()} 
+            for e in edges]
+    
+    # One to one mapping of counts for each node/edge to chunk_uuids
+    # This will help to decide to update or delete 
+    node_has_n_uuids = defaultdict(lambda: {"count": 0, "uuids": []})
+    edge_has_n_uuids = defaultdict(lambda: {"count": 0, "uuids": []})
+
+
+    for chunk_uuid in chunk_uuids:
+        for n in nodes:
+            if chunk_uuid in n.get("source_id", []):
+                node_has_n_uuids[n["name"]]["count"] += 1
+                node_has_n_uuids[n["name"]]["uuids"].append(chunk_uuid)
+        for e in edges:
+            if chunk_uuid in e.get("source_id", []):
+                edge_pair = (e["source_name"], e["target_name"])
+                edge_has_n_uuids[edge_pair]["count"] += 1
+                edge_has_n_uuids[edge_pair]["uuids"].append(chunk_uuid)
+    
+    for n in nodes:
+        n["remaining_source_ids"] = len(n.get("source_id", [])) - node_has_n_uuids[n["name"]]["count"]
+
+    for e in edges:
+        edge_pair = (e["source_name"], e["target_name"])
+        e["remaining_source_ids"] = len(e.get("source_id", [])) - edge_has_n_uuids[edge_pair]["count"]
+
+    # Query nodes
+    for n in nodes:
+        name = n["name"]
+        if n["remaining_source_ids"] < 0:
+            LOGGER.warning("Node %s has negative remaining_source_ids", name)
+        elif n["remaining_source_ids"] == 0:
+            nodes_to_delete.append(name)
+        else:
+            # Update source_id by removing chunk_uuids
+            new_source_ids = [s for s in n.get("source_id", []) if s not in chunk_uuids]
+            new_source_id_str = delim.join(new_source_ids)
+            nodes_to_update.append({
+                "name": name,
+                "type": n.get("type", ""),
+                "description": n.get("description", ""),
+                "source_id": new_source_id_str,
+                "filepath": n.get("filepath", ""),
+            })
+
+    # Query edges
+    for e in edges:
+        edge_pair = (e["source_name"], e["target_name"])
+        if e["remaining_source_ids"] < 0:
+            LOGGER.warning("Edge %s has negative remaining_source_ids", edge_pair)
+        elif e["remaining_source_ids"] == 0:
+            edges_to_delete.append(edge_pair)
+        else:
+            # Update source_id by removing chunk_uuids
+            new_source_ids = [s for s in e.get("source_id", []) if s not in chunk_uuids]
+            new_source_id_str = delim.join(new_source_ids)
+            edges_to_update.append({
+                "source_name": e["source_name"],
+                "target_name": e["target_name"],
+                "weight": e.get("weight", 0),
+                "description": e.get("description", ""),
+                "keywords": e.get("keywords", ""),
+                "source_id": new_source_id_str,
+                "filepath": e.get("filepath", ""),
+            })
+
+    # Apply graph updates
+    if nodes_to_update:
+        LOGGER.info("Updating %d nodes with source_id changes", len(nodes_to_update))
+        storage.graphdb.update_nodes(nodes_to_update)
+
+    if nodes_to_delete:
+        LOGGER.info("Deleting %d nodes with no remaining source_ids", len(nodes_to_delete))
+        storage.delete_nodes(nodes_to_delete)
+
+    if edges_to_update:
+        LOGGER.info("Updating %d edges with source_id changes", len(edges_to_update))
+        storage.graphdb.update_edges(edges_to_update)
+
+    if edges_to_delete:
+        LOGGER.info("Deleting %d edges with no remaining source_ids", len(edges_to_delete))
+        storage.delete_edges(edges_to_delete)
+
+    # Step 3: Update EntityVectors - remove source_ids and delete if empty
+    # We need to get all entities and check their metadata
+    # Since we deleted nodes, we also need to delete their vectors
+    if nodes_to_delete:
+        LOGGER.info("Removing %d entity vectors", len(nodes_to_delete))
+        storage.delete_entity_vector(nodes_to_delete)
+
+    # For updated nodes, we need to upsert them in the vector DB
+    if nodes_to_update:
+        LOGGER.info("Updating %d entity vectors", len(nodes_to_update))
+        storage.upsert_entity_vector(nodes_to_update)
+
+    # Step 4: Update RelationVectors - remove source_ids and delete if empty
+    if edges_to_delete:
+        LOGGER.info("Removing %d relation vectors", len(edges_to_delete))
+        storage.delete_relation_vector(edges_to_delete)
+
+    # For updated edges, we need to upsert them in the vector DB
+    if edges_to_update:
+        LOGGER.info("Updating %d relation vectors", len(edges_to_update))
+        storage.upsert_relation_vector(edges_to_update)
+
+    # Step 5: Remove chunk vectors
+    LOGGER.info("Removing %d chunk vectors", len(chunk_uuids))
+    for chunk_uuid in chunk_uuids:
+        storage.delete_chunk_vector(chunk_uuid)
+
+    # Step 6: Remove chunks from ChunksDB
+    LOGGER.info("Removing %d chunks from ChunksDB", len(chunk_uuids))
+    storage.delete_chunks_by_uuids(chunk_uuids)
+
+    # Step 7: Remove document from DocumentsDB
+    LOGGER.info("Removing document from DocumentsDB")
+    storage.delete_document(doc_id)
+
+    # Step 8: Sanity check
+    # If a node removed and if the edge is still there, that is a problem
+    # But the other way around is fine (edge removed but node exists)
+    # The latter might lead to orphan nodes, which is acceptable for now
+    # we will apply cross check with set operations by looking at all edges and nodes again
+    all_doc_ids = {d["doc_id"] for d in storage.get_all_documents() if d.get("doc_id")}
+    all_chunks = []
+    for d in all_doc_ids:
+        chs = storage.get_chunks_by_doc_id(d)
+        all_chunks.extend(chs or [])
+    all_chunk_uuids = [c["chunk_uuid"] for c in all_chunks if c.get("chunk_uuid")]
+    nodes_after = storage.get_nodes_by_chunk_uuids(all_chunk_uuids)
+    edges_after = storage.get_edges_by_chunk_uuids(all_chunk_uuids)
+    node_names_after = {n["name"] for n in nodes_after if n.get("name")}
+    for e in edges_after:
+        src, tgt = e.get("source_name"), e.get("target_name")
+        if src not in node_names_after or tgt not in node_names_after:
+            LOGGER.warning(
+                "Sanity check warning: edge (%s, %s) exists without corresponding nodes after deletion",
+                src,
+                tgt,
+            )
+            storage.delete_edges( [(src, tgt)] )
+            storage.delete_relation_vector( [(src, tgt)] )
+            LOGGER.info("Removed edge (%s, %s) due to missing nodes", src, tgt)
+
+    LOGGER.info("Successfully removed document %s and all associated data", filename)
+
+
+def ingest_paths(
+    paths: List[Path],
+    *,
+    documents_root: Optional[Union[Path, str]] = None,
+    project_paths: Optional[ProjectPaths] = None,
+    storage_paths=None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Ingests files from given paths into the knowledge graph storage system.
+
+    This function processes files, chunks them, extracts entities and relationships,
+    and stores everything in the database and vector stores.
+
+    Args:
+        paths (List[Path]): List of file paths to ingest.
+
+    Returns:
+        None
+    """
+    def report(message: str) -> None:
+        LOGGER.info(message)
+        if progress_callback is not None and settings.logging.verbosity_enabled:
+            progress_callback(message)
+
+    active_project_paths = _resolve_runtime_project_paths(
+        paths=paths,
+        documents_root=documents_root,
+        project_paths=project_paths,
+    )
+    if active_project_paths is not None:
+        ensure_project_dirs(active_project_paths)
+    _configure_ingestion_logger(active_project_paths)
+
+    effective_storage_paths = (
+        active_project_paths.storage
+        if active_project_paths is not None
+        else storage_paths
+    )
+
+    report("Initializing project storage")
+    storage = Storage(paths=effective_storage_paths)
+    storage.init()
+    LOGGER.info("Starting ingestion for %d paths", len(paths))
+    report(f"Queued {len(paths)} files for ingestion")
+
+    all_chunks: List[Dict[str, Any]] = []
+    all_entities: List[Dict[str, Any]]  = []
+    all_relations: List[Dict[str, Any]]  = []
+    processed_files = 0
+    skipped_files = 0
+    removed_files = 0
+
+    report("Scanning existing project documents")
+    # Remove documents that are no longer present
+    all_existing_docs = storage.get_all_documents()
+    existing_filenames = {doc["filename"] for doc in all_existing_docs if doc.get("filename")}
+    files_to_be_removed = existing_filenames - {p.name for p in paths}
+    for fname in files_to_be_removed:
+        report(f"Removing stale document {fname}")
+        remove_document_from_storage(storage, fname)
+        removed_files += 1
+
+    total_paths = len(paths)
+    for index, p in enumerate(paths, start=1):
+        step_prefix = f"{index}/{total_paths} {p.name}"
+        report(f"{step_prefix} - checking file")
+        if not p.exists() or not p.is_file():
+            report(f"{step_prefix} - skipped (path missing or not a file)")
+            skipped_files += 1
+            continue
+        content_hash = file_sha256(p)
+        if should_skip_ingestion(storage, p, content_hash):
+            LOGGER.info("Skipping %s (unchanged)", p.name)
+            report(f"{step_prefix} - skipped (unchanged)")
+            skipped_files += 1
+            continue
+        # skip temporary files created by ms word
+        if ((p.name.lower().startswith("~$") and p.name.lower().endswith((".docx", ".doc"))) or
+            (p.name.lower().endswith((".tmp", ".temp")) and "word" in p.name.lower())):
+            LOGGER.info("Skipping temporary file %s", p.name)
+            report(f"{step_prefix} - skipped (temporary file)")
+            skipped_files += 1
+            continue
+        report(f"{step_prefix} - parsing file")
+        pages, file_meta = parse_to_pages(p)
+        if not pages or not file_meta:
+            LOGGER.warning("Skipping %s due to parsing error", p)
+            report(f"{step_prefix} - parsing failed")
+            skipped_files += 1
+            continue
+        doc_exists = storage.get_document_by_filename(p.name).get("filename") == p.name if storage.get_document_by_filename(p.name) else False
+        if doc_exists: # document exists but content hash differs.
+            report(f"{step_prefix} - replacing changed document")
+            remove_document_from_storage(storage, p.name)
+
+        file_meta = normalize_metadata(file_meta)
+        full_text = "\n".join([page[1] for page in pages])
+        
+        # Build storage row (doc_meta) – this is distinct from file_meta and is schema-aligned fields expected by DocumentsDB
+        st = p.stat()
+        doc_meta = {
+            "doc_id": str(uuid.uuid4()),
+            "filename": p.name,
+            "filepath": str(p.resolve()),
+            "file_size": st.st_size,
+            "last_modified": st.st_mtime,
+            "created": getattr(st, "st_birthtime", st.st_ctime),
+            "extension": p.suffix.lower(),
+            "mime_type": ((file_meta or {}).get("mime_type") or mimetypes.guess_type(str(p))[0] or ""),
+            "language": (file_meta or {}).get("language", "unknown"),
+            "content_hash": content_hash,                
+            "full_char_count": len(full_text),
+        }
+
+        _write_raw_document_snapshot(
+            project_paths=active_project_paths,
+            filename=p.name,
+            doc_meta=doc_meta,
+            raw_text=full_text,
+        )
+
+        report(f"{step_prefix} - storing document")
+        storage.add_document(doc_meta, full_text)  # from storage.py
+
+        report(f"{step_prefix} - building chunks")
+        chunks = build_chunks(
+            pages,
+            doc_meta["doc_id"],
+            doc_meta["filename"],
+            filepath=doc_meta["filepath"],
+            document_language=doc_meta["language"],
+        )
+        report(f"{step_prefix} - storing {len(chunks)} chunks")
+        storage.add_chunks(chunks)  # from storage.py
+        all_chunks.extend(chunks)
+
+        # Extract entities and relations from chunks
+        # res['entities'], res['relationships'], res['content_keywords']
+        report(f"{step_prefix} - extracting entities and relations")
+        res = extract_from_chunks(
+            chunks,
+            storage=storage,
+        )
+        
+        # Consolidate/merge entities (by (name,type)) and upsert those first
+        entities_in = res.get("entities", []) or []
+        edges_in = res.get("relationships", []) or []
+
+        # Ensure all edge endpoints exist as nodes, create placeholders if needed
+        placeholders = ensure_edge_endpoints(storage, edges_in)
+        if placeholders:
+            all_entities.extend(placeholders)           # collect for vector DB later
+
+        report(f"{step_prefix} - merging graph data")
+        nodes, edges = merge_graph_data(storage, entities_in, edges_in)
+
+        if nodes:
+            report(f"{step_prefix} - writing {len(nodes)} entities")
+            storage.upsert_nodes(nodes)                 # write schema
+            all_entities.extend(nodes)                  # collect for vector DB later
+
+        # Group/merge edges and upsert
+        if edges:
+            report(f"{step_prefix} - writing {len(edges)} relations")
+            storage.upsert_edges(edges)                 # write schema
+            all_relations.extend(edges)                 # collect for vector DB later
+        validation_results = res.get("validation_results") or []
+        if validation_results:
+            report(f"{step_prefix} - writing extraction diagnostics")
+        _write_extraction_diagnostics(active_project_paths, p.name, validation_results)
+        report(f"{step_prefix} - completed")
+        processed_files += 1
+
+    # Finally, add all chunks, entities, and relations to vector DB   
+    if all_chunks:
+        report("Writing chunk vectors")
+        storage.upsert_chunk_vector(all_chunks) # from storage.py
+        deduped_entities = dedupe_entities_for_vectors(all_entities)
+        if deduped_entities:
+            report("Writing entity vectors")
+            storage.upsert_entity_vector(deduped_entities)
+        if all_relations:
+            report("Writing relation vectors")
+            storage.upsert_relation_vector(all_relations)
+    report("Writing retrieval snapshot")
+    retrieval_snapshot = _write_retrieval_graph_snapshot(storage, active_project_paths)
+    report("Completed ingestion")
+    LOGGER.info(
+        "Completed ingestion: processed=%d skipped=%d removed=%d chunks=%d entities=%d relations=%d snapshot=%s",
+        processed_files,
+        skipped_files,
+        removed_files,
+        len(all_chunks),
+        len(all_entities),
+        len(all_relations),
+        retrieval_snapshot,
+    )
+    return {
+        "documents_root": str(active_project_paths.documents_root) if active_project_paths else None,
+        "project_root": str(active_project_paths.project_root) if active_project_paths else None,
+        "retrieval_graph_pickle": str(retrieval_snapshot) if retrieval_snapshot is not None else None,
+        "processed_files": processed_files,
+        "skipped_files": skipped_files,
+        "removed_files": removed_files,
+        "chunk_count": len(all_chunks),
+        "entity_count": len(all_entities),
+        "relation_count": len(all_relations),
+    }
+
+
+def main():
+    folder_input = input(
+        "Source folder path of documents (leave blank for ./docs): "
+    ).strip()
+    root = Path(folder_input) if folder_input else Path("docs")
+    paths = list_document_paths(root)
+    if not paths:
+        print(
+            f"No supported files found in {root.resolve()} "
+            f"with extensions: {', '.join(VALID_EXTENSIONS)}."
+        )
+        return
+    ingest_paths(paths, documents_root=root)
+
+if __name__ == "__main__":
+    main()
