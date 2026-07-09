@@ -3,7 +3,7 @@ name: Daily backup of pbl-nl/appl-kgraph
 on:
   schedule:
     # Every day at 03:17 UTC
-    - cron: '17 3 * * *'
+    - cron: '13 12 * * *'
   workflow_dispatch:
 
 permissions:
